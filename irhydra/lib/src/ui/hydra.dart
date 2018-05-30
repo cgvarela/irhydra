@@ -16,12 +16,6 @@ import 'package:polymer/polymer.dart';
 
 import 'package:archive/archive.dart' show BZip2Decoder, TarDecoder;
 
-final MODES = [
-  () => new art.Mode(),  // Must come before V8 mode.
-  () => new v8.Mode(),
-  () => new dartvm.Mode(),
-];
-
 _createV8DeoptDemo(type) => [
   "demos/v8/deopt-${type}/hydrogen.cfg",
   "demos/v8/deopt-${type}/code.asm"
@@ -52,13 +46,17 @@ class TextFile {
 
   TextFile(this.file, this.action);
 
-  load() => _readAsText(file).then(action);
+  load() => _read(file).then(action);
 
-  static _readAsText(file) {
-    final reader = new FileReader();
-    final result = reader.onLoad.first.then((_) => reader.result);
-    reader.readAsText(file);
-    return result;
+  static _read(file) {
+    // We would like to load file as binary to avoid
+    // line ending normalization.
+    // FileReader.readAsBinaryString is not exposed in Dart
+    // so we trampoline through JS.
+    async.Completer completer = new async.Completer();
+    js.context.callMethod('readAsBinaryString', [
+      file, completer.complete]);
+    return completer.future;
   }
 }
 
@@ -71,6 +69,8 @@ timeAndReport(action, report) {
 
 @CustomTag('hydra-app')
 class HydraElement extends PolymerElement {
+  var MODES;
+
   @observable var mode;
   @observable var files;
   @observable var phase;
@@ -82,6 +82,8 @@ class HydraElement extends PolymerElement {
 
   @observable var crlfDetected = false;
   @observable var sourceAnnotatorFailed = false;
+  @observable var newPositionsWithoutStartPos = false;
+  @observable var hasTurboFanCode = false;
 
   @observable var sourcePath = toObservable([]);
 
@@ -101,7 +103,13 @@ class HydraElement extends PolymerElement {
 
   var blockRef;
 
-  HydraElement.created() : super.created();
+  HydraElement.created() : super.created() {
+    MODES = [
+      () => new art.Mode(),  // Must come before V8 mode.
+      () => new v8.Mode(this),
+      () => new dartvm.Mode(),
+    ];
+  }
 
   _requestArtifact(path) {
     done(x) {
@@ -261,6 +269,10 @@ class HydraElement extends PolymerElement {
       if (!phase.method.sources.isEmpty) {
         sourcePath.add(phase.method.inlined.first);
       }
+
+      if (ir.blocks.isEmpty && sourcePath.isNotEmpty) {
+        activeTab = "source";
+      }
     } else {
       ir = null;
     }
@@ -308,6 +320,10 @@ class HydraElement extends PolymerElement {
   showLegend() => graphpane.showLegend();
 
   navigateToDeoptAction(event, deopt, target) {
+    if (activeTab == 'ir') {
+      irpane.scrollToDeopt(deopt);
+    }
+
     if (phase.method.inlined.isEmpty)
       return;
 
@@ -384,7 +400,8 @@ class HydraElement extends PolymerElement {
     demangleNames = true;
     profile = null;
     sortMethodsBy = "time";
-    crlfDetected = sourceAnnotatorFailed = false;
+    crlfDetected = sourceAnnotatorFailed = newPositionsWithoutStartPos = false;
+    hasTurboFanCode = false;
   }
 
   methodsChanged() {
@@ -430,9 +447,11 @@ class HydraElement extends PolymerElement {
 
   /** Load data from the given textual artifact if any mode can handle it. */
   loadData(text) {
-    // Normalize line endings.
+    // Warn about Windows-style (CRLF) line endings.
+    // Don't normalize the input: V8 writes code trace in
+    // binary mode (retaining original line endings) so
+    // in theory everything should just work.
     crlfDetected = crlfDetected || text.contains("\r\n");
-    text = text.replaceAll(new RegExp(r"\r\n|\r"), "\n");
 
     if (mode == null || !mode.load(text)) {
       var newMode;

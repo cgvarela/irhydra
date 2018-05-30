@@ -44,6 +44,10 @@ class _V8HIRDescriptor extends HIRDescriptor {
 class Mode extends BaseMode {
   final irs = const [const _V8HIRDescriptor()];
 
+  final statusObject;
+
+  Mode(this.statusObject);
+
   /** [true] if code dump file is already loaded. */
   var codeLoaded = false;
 
@@ -71,7 +75,7 @@ class Mode extends BaseMode {
     } else if (code_parser.canRecognize(text) && !codeLoaded) {
       // This is an stdout dump containing native code and deopts.
       timeline = [];
-      _merge(methods, code_parser.preparse(text, timeline));
+      _merge(methods, code_parser.preparse(text, timeline, statusObject));
       codeLoaded = true;
       return true;
     } else {
@@ -108,17 +112,39 @@ class Mode extends BaseMode {
       }
 
       codeCollector.collectRest();
-      if (!codeCollector.isEmpty) {
+      if (!codeCollector.isEmpty && previous != null) {
         if (previous.code == null) previous.code = [];
         previous.code.addAll(codeCollector.collected);
       }
     }
   }
 
+  _mapTurboFanDeopts(ir.Method method) {
+    for (var deopt in method.deopts) {
+      if (deopt.srcPos != null) {
+        continue;
+      }
+
+      final m = new RegExp(r";;; deoptimize at (-?\d+)(?:_(\d+))?").firstMatch(deopt.raw.join('\n'));
+      if (m == null) continue;
+      var inliningId = m.group(1);
+      var srcPos = m.group(2);
+      if (srcPos == null) {
+        srcPos = inliningId;
+        inliningId = "-1";
+      }
+      inliningId = int.parse(inliningId) + 1;
+      srcPos = int.parse(srcPos) - method.inlined[inliningId].source.startPos;
+      deopt.srcPos = new ir.SourcePosition(inliningId, srcPos);
+    }
+
+  }
+
   toIr(method, phase, statusObject) {
-    final blocks = hydrogen_parser.parse(method, phase.ir, statusObject);
+    final blocks = phase.ir != null ? hydrogen_parser.parse(method, phase.ir, statusObject) : {};
     final code = code_parser.parse(phase.code);
     _attachCode(blocks, code);
+    _mapTurboFanDeopts(method);
     return new ir.ParsedIr(method, this, blocks, code, method.deopts);
   }
 
@@ -133,7 +159,7 @@ class Mode extends BaseMode {
     }
 
     // Both are present, thus have to merge.
-    mergeMethod(methodIr, methodCode) {
+    mergeMethod(ir.Method methodIr, ir.Method methodCode) {
       // Move code, sources and deopt information to the method with IR as it
       // can contain information about multiple phases and method with code
       // always contains only one.
@@ -148,6 +174,10 @@ class Mode extends BaseMode {
 
       methodIr.deopts.addAll(methodCode.deopts);
       methodIr.worstDeopt = methodCode.worstDeopt;
+      if (methodCode.tags != null) {
+        methodIr.tags ??= new Set<String>();
+        methodIr.tags.addAll(methodCode.tags);
+      }
     }
 
     // First try to merge based on optimization IDs.
@@ -160,6 +190,14 @@ class Mode extends BaseMode {
       // TODO(mraleph) be more resilent and report meaningful error if
       // we can't match.
       for (var currentCode in code) {
+        if (opt2ir[currentCode.optimizationId] == null) {
+          print('Unable to find IR for ${currentCode}');
+          if (currentCode.isTagged('turbofan')) {
+            print('... ${currentCode} was compiled with TurboFan. IRHydra does not support TurboFan code and IR artifacts - only Crankshaft code. There are no plans to support TurboFan. Contact V8 team for assistance.');
+            statusObject.hasTurboFanCode = true;
+          }
+          continue;
+        }
         mergeMethod(opt2ir[currentCode.optimizationId], currentCode);
       }
       methods = ir;
@@ -183,7 +221,7 @@ class Mode extends BaseMode {
         i = currentIr + 1;
       } else {
         // Report ignored code object to console for debugging purposes.
-        print("Ignoring code artifact for '${code[j].name.full}'. It doesn't have IR graph.");
+        print("Ignoring code artifact for '${code[j].name.full}' (id = ${code[j].optimizationId}). It doesn't have IR graph.");
       }
     }
 

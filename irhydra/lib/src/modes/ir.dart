@@ -106,8 +106,9 @@ class FunctionSource {
   final int id;
   final String name;
   final Iterable source;
+  final int startPos;
 
-  FunctionSource(this.id, this.name, this.source);
+  FunctionSource(this.id, this.name, this.source, this.startPos);
 }
 
 class SourcePosition {
@@ -179,12 +180,23 @@ class Method extends Observable {
   var srcMapping;
   var interesting;
 
+  Set<String> tags;
+
   Method(this.name, {this.optimizationId});
 
   addDeopt(deopt) {
     worstDeopt = Deopt.worst(worstDeopt, deopt);
     deopts.add(deopt);
   }
+
+  isTagged(String tag) => tags != null && tags.contains(tag);
+
+  tag(String t) {
+    if (tags == null) tags = new Set<String>();
+    tags.add(t);
+  }
+
+  toString() => "Method(${name.full}, id: ${optimizationId})";
 }
 
 class ParsedIr {

@@ -35,7 +35,7 @@ List<IR.Method> preparse(String str) {
   final tagRe = new RegExp(r"(begin|end)_(compilation|cfg)\n");
 
   // Matches line containing method name and optimization id.
-  final compilationRe = new RegExp(r'name "([^"]*)"\n\s+method "[^"]*(:\d+)?"');
+  final compilationRe = new RegExp(r'name "([^"]*)"\n\s+method "([^"]*)"');
 
   // Matches line containing the name field.
   final nameRe = new RegExp(r'name "([^"]*)"');
@@ -56,9 +56,11 @@ List<IR.Method> preparse(String str) {
       // This is the compilation record for the method.
       // Extract the name from the record.
       final substr = str.substring(start, match.start);
-      parsing.match(substr, compilationRe, (name, [optId]) {
+      parsing.match(substr, compilationRe, (name, methodName) {
         // Create the method and make it current.
-        if (optId != null) optId = optId.substring(1);
+        final m = new RegExp(r':(\d+)$').firstMatch(methodName);
+        var optId;
+        if (m != null) optId = m.group(1);
         method = new IR.Method(name_parser.parse(name),
                                optimizationId: optId);
         methods.add(method);
@@ -87,7 +89,7 @@ _deferSubstring(str, start, end) =>
 /** Parse given phase IR stored in the deferred substring thunk. */
 Map parse(IR.Method method, Function ir, statusObject) {
   final stopwatch = new Stopwatch()..start();
-  final parser = new CfgParser(ir())..parse();
+  final parser = new CfgParser(method, ir())..parse();
 
   for (var deopt in method.deopts) {
     if (deopt.id == null) {
@@ -169,6 +171,8 @@ IRHydra assumes LF-only endings. Contact @mraleph for troubleshooting.
     print(e);
     print(stack);
     statusObject.sourceAnnotatorFailed = true;
+    for (var f in method.inlined)
+        f.annotations = null;
   }
 
   print("hydrogen_parser.parse took ${stopwatch.elapsedMilliseconds}");
@@ -181,9 +185,11 @@ class CfgParser extends parsing.ParserBase {
 
   var lirOperands, hirOperands;
 
-  CfgParser(str) : super(str.split('\n')) {
+  CfgParser(IR.Method method, str) : super(str.split('\n')) {
     hirOperands = parsing.makeSplitter({
       r"0x[a-f0-9]+": (hirId, val) => new Constant(val),
+      // This is to highlight %p formatted pointers on Win64.
+      r"\b[A-F0-9]{16}\b": (hirId, val) => new Constant(val),
       r"B\d+\b": (hirId, val) => new IR.BlockRef(val),
       r"[a-zA-Z]+\d+\b": (hirId, val) => new IR.ValRef(val),
       r"range:(-?\d+)_(-?\d+)(_m0)?": (hirId, low, high, m0) => new Range(low, high, m0 != null),
@@ -194,15 +200,27 @@ class CfgParser extends parsing.ParserBase {
       },
       r"type:[-\w]+": (hirId, val) => new Type(val.split(':').last),
       r"uses:\w+": (hirId, _) => null,
-      r"pos:(\d+)(_(\d+))?": (hirId, functionId, _, pos) {
+      r"pos:(\d+)(_(\d+))?": (hirId, inliningId, _, pos) {
         if (pos == null) {
-          pos = int.parse(functionId);
-          functionId = 0;
+          pos = int.parse(inliningId);
+          inliningId = 0;
+          if (method.sources.isNotEmpty && method.sources[0].startPos != null) {
+            pos -= method.sources[0].startPos;
+          }
         } else {
           pos = int.parse(pos);
-          functionId = int.parse(functionId);
+          inliningId = int.parse(inliningId);
         }
-        hir2pos[hirId] = new IR.SourcePosition(functionId, pos);
+        hir2pos[hirId] = new IR.SourcePosition(inliningId, pos);
+      },
+      r"pos:inlining\((\d+)\),(\d+)": (hirId, inliningId, pos) {
+        pos = int.parse(pos);
+        inliningId = int.parse(inliningId) + 1;
+        if (method.inlined.isNotEmpty &&
+            method.inlined[inliningId].source.startPos != null) {
+          pos -= method.inlined[inliningId].source.startPos;
+        }
+        hir2pos[hirId] = new IR.SourcePosition(inliningId, pos);
       }
     });
 
